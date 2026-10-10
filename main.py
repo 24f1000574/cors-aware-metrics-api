@@ -1,3 +1,5 @@
+import collections
+from decimal import Decimal
 import time
 import uuid
 from typing import Optional
@@ -8,6 +10,8 @@ import jwt
 
 USER_EMAIL = "24f1000574@ds.study.iitm.ac.in"
 ALLOWED_ORIGIN_STATS = "https://dash-kssbbx.example.com"
+ASSIGNED_ANALYTICS_API_KEY = "ak_dardxo7jihv44pvmrpzvpde7"
+
 
 IDP_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
@@ -114,6 +118,8 @@ class GlobalMiddleware:
                         resp_headers.append((b"vary", b"Origin"))
                     else:
                         resp_headers.append((b"access-control-allow-origin", b"*"))
+                    resp_headers.append((b"access-control-allow-headers", b"*"))
+                    resp_headers.append((b"access-control-allow-methods", b"GET, POST, OPTIONS, HEAD, PUT, DELETE, PATCH"))
 
                 message["headers"] = resp_headers
             await send(message)
@@ -235,6 +241,84 @@ def get_stats(values: str = Query(..., description="Comma-separated integers")):
     }
 
 
+# ==========================================
+# POST /analytics Endpoint (Question 7)
+# ==========================================
+@app.post("/analytics")
+async def post_analytics(request: Request):
+    # Require header X-API-Key: ak_dardxo7jihv44pvmrpzvpde7
+    # Missing or wrong key -> HTTP 401
+    api_key = request.headers.get("x-api-key")
+    if not api_key:
+        return JSONResponse(status_code=401, content={"detail": "Missing X-API-Key header"})
+
+    clean_key = api_key.strip().strip('"').strip("'")
+    if clean_key != ASSIGNED_ANALYTICS_API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
+
+    # Parse JSON body
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"detail": "Invalid JSON body"})
+
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"detail": "Request body must be a JSON object"})
+
+    events = body.get("events")
+    if not isinstance(events, list):
+        return JSONResponse(status_code=400, content={"detail": "'events' must be a list"})
+
+    # Aggregations:
+    # total_events — count of all events in the batch.
+    # unique_users — number of distinct user values.
+    # revenue — sum of amount values where amount > 0 only (ignore zero and negative amounts).
+    # top_user — the user whose positive-amount total is highest. The grader ensures there are no ties.
+    # email — your logged-in email address.
+    total_events = len(events)
+    unique_users_set = set()
+    total_rev_dec = Decimal("0")
+    user_positive_totals = collections.defaultdict(Decimal)
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        u = ev.get("user")
+        if u is not None:
+            unique_users_set.add(str(u))
+
+        amt = ev.get("amount")
+        if amt is not None:
+            try:
+                amt_dec = Decimal(str(amt))
+                if amt_dec > 0:
+                    total_rev_dec += amt_dec
+                    if u is not None:
+                        user_positive_totals[str(u)] += amt_dec
+            except Exception:
+                pass
+
+    unique_users = len(unique_users_set)
+    revenue = float(total_rev_dec)
+
+    if user_positive_totals:
+        top_user = max(user_positive_totals.items(), key=lambda item: item[1])[0]
+    else:
+        top_user = ""
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "email": USER_EMAIL,
+            "total_events": total_events,
+            "unique_users": unique_users,
+            "revenue": revenue,
+            "top_user": top_user,
+        },
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
