@@ -1,17 +1,32 @@
 import collections
+import datetime
 from decimal import Decimal
+import json
 import time
 import uuid
 from typing import Optional
-from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi import FastAPI, Request, Query, HTTPException, Response
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 import jwt
+from prometheus_client import CollectorRegistry, Counter, generate_latest, CONTENT_TYPE_PLAIN_0_0_4
 
 USER_EMAIL = "24f1000574@ds.study.iitm.ac.in"
 ALLOWED_ORIGIN_STATS = "https://dash-kssbbx.example.com"
 ASSIGNED_ANALYTICS_API_KEY = "ak_dardxo7jihv44pvmrpzvpde7"
+APP_START_TIME = time.time()
 
+# Prometheus metrics setup
+metrics_registry = CollectorRegistry()
+REQUEST_COUNTER = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    registry=metrics_registry,
+)
+
+# In-memory log buffer for structured JSON logs
+MAX_LOG_ENTRIES = 10000
+LOG_BUFFER = collections.deque(maxlen=MAX_LOG_ENTRIES)
 
 IDP_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
@@ -29,10 +44,11 @@ AUDIENCE = "tds-e8pdjl8x.apps.exam.local"
 
 class GlobalMiddleware:
     """
-    ASGI middleware that ensures every HTTP response carries:
-    - X-Request-ID: unique request identifier (UUID)
-    - X-Process-Time: handler duration in seconds as a non-negative decimal number
-    - CORS headers: strict per-origin on /stats, permissive on /verify and others
+    ASGI middleware that ensures every HTTP request:
+    - Increments the Prometheus http_requests_total counter
+    - Adds X-Request-ID and X-Process-Time headers
+    - Appends structured JSON log entries (level, ts, path, request_id)
+    - Provides CORS handling (strict for /stats, permissive for others)
     """
     def __init__(self, app: ASGIApp):
         self.app = app
@@ -41,6 +57,9 @@ class GlobalMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+
+        # Increment global HTTP request counter for any endpoint
+        REQUEST_COUNTER.inc()
 
         start_time = time.perf_counter()
         request_id = str(uuid.uuid4())
@@ -72,10 +91,8 @@ class GlobalMiddleware:
                     ])
                     status = 200
                 else:
-                    # Evil / unallowed origin preflight rejected with no ACAO header
                     status = 400
             else:
-                # Other routes: allow preflight
                 allowed_hdr = origin_bytes if origin_bytes else b"*"
                 resp_headers.extend([
                     (b"access-control-allow-origin", allowed_hdr),
@@ -87,6 +104,16 @@ class GlobalMiddleware:
                 if origin_bytes:
                     resp_headers.append((b"vary", b"Origin"))
                 status = 200
+
+            # Log preflight request
+            log_entry = {
+                "level": "INFO",
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                "path": path,
+                "request_id": request_id,
+            }
+            LOG_BUFFER.append(log_entry)
+            print(json.dumps(log_entry), flush=True)
 
             await send({
                 "type": "http.response.start",
@@ -124,10 +151,20 @@ class GlobalMiddleware:
                 message["headers"] = resp_headers
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            log_entry = {
+                "level": "INFO",
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                "path": path,
+                "request_id": request_id,
+            }
+            LOG_BUFFER.append(log_entry)
+            print(json.dumps(log_entry), flush=True)
 
 
-app = FastAPI(title="Token Verification & Metrics API")
+app = FastAPI(title="Production Observability & Metrics API")
 app.add_middleware(GlobalMiddleware)
 
 
@@ -135,9 +172,74 @@ app.add_middleware(GlobalMiddleware)
 def read_root():
     return {
         "status": "healthy",
-        "service": "Token Verification & Metrics API",
+        "service": "Production Observability & Metrics API",
         "email": USER_EMAIL,
     }
+
+
+# ==========================================
+# Question 8 Endpoints: Observability & Work
+# ==========================================
+
+@app.get("/work")
+@app.get("/work/")
+def do_work(request: Request, n: Optional[str] = None):
+    val = 0
+    if n is not None:
+        try:
+            val = int(n)
+        except ValueError:
+            try:
+                val = int(float(n))
+            except Exception:
+                val = 0
+
+    k = max(0, val)
+    if k > 0:
+        total = 0
+        limit = min(k, 100000)
+        for i in range(limit):
+            total += (i * i) % 1000003
+
+    return {
+        "email": USER_EMAIL,
+        "done": val,
+    }
+
+
+@app.get("/metrics")
+@app.get("/metrics/")
+def get_metrics():
+    content = generate_latest(metrics_registry)
+    return Response(
+        content=content,
+        media_type=CONTENT_TYPE_PLAIN_0_0_4,
+    )
+
+
+@app.get("/healthz")
+@app.get("/healthz/")
+def healthz():
+    uptime = max(0.0, float(time.time() - APP_START_TIME))
+    return {
+        "status": "ok",
+        "uptime_s": uptime,
+    }
+
+
+@app.get("/logs/tail")
+@app.get("/logs/tail/")
+def get_logs_tail(request: Request, limit: Optional[str] = None):
+    lim = 100
+    if limit is not None:
+        try:
+            lim = int(limit)
+        except Exception:
+            lim = 100
+    logs_snapshot = list(LOG_BUFFER)
+    if lim > 0:
+        logs_snapshot = logs_snapshot[-lim:]
+    return JSONResponse(content=logs_snapshot)
 
 
 # ==========================================
@@ -246,8 +348,6 @@ def get_stats(values: str = Query(..., description="Comma-separated integers")):
 # ==========================================
 @app.post("/analytics")
 async def post_analytics(request: Request):
-    # Require header X-API-Key: ak_dardxo7jihv44pvmrpzvpde7
-    # Missing or wrong key -> HTTP 401
     api_key = request.headers.get("x-api-key")
     if not api_key:
         return JSONResponse(status_code=401, content={"detail": "Missing X-API-Key header"})
@@ -256,7 +356,6 @@ async def post_analytics(request: Request):
     if clean_key != ASSIGNED_ANALYTICS_API_KEY:
         return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
 
-    # Parse JSON body
     try:
         body = await request.json()
     except Exception:
@@ -269,12 +368,6 @@ async def post_analytics(request: Request):
     if not isinstance(events, list):
         return JSONResponse(status_code=400, content={"detail": "'events' must be a list"})
 
-    # Aggregations:
-    # total_events — count of all events in the batch.
-    # unique_users — number of distinct user values.
-    # revenue — sum of amount values where amount > 0 only (ignore zero and negative amounts).
-    # top_user — the user whose positive-amount total is highest. The grader ensures there are no ties.
-    # email — your logged-in email address.
     total_events = len(events)
     unique_users_set = set()
     total_rev_dec = Decimal("0")
@@ -321,4 +414,3 @@ async def post_analytics(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-

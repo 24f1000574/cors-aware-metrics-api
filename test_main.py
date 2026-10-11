@@ -1,6 +1,7 @@
 import time
 import base64
 import random
+import re
 import collections
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
@@ -25,9 +26,82 @@ test_priv_pem = test_priv_key.private_bytes(
 ).decode("utf-8")
 
 
+def parse_http_requests_total(metrics_text: str) -> float:
+    match = re.search(r"^http_requests_total(?:\s*\{[^}]*\})?\s+([0-9.]+)", metrics_text, re.MULTILINE)
+    assert match is not None, f"Could not find http_requests_total in metrics output:\n{metrics_text}"
+    return float(match.group(1))
+
+
+def test_question_8_observability():
+    print("--- Running Question 8 (Observability, Health & Structured Logs) Tests ---")
+
+    # 1. Baseline metrics reading
+    metrics_res = client.get("/metrics")
+    assert metrics_res.status_code == 200
+    assert "http_requests_total" in metrics_res.text
+    baseline = parse_http_requests_total(metrics_res.text)
+    print(f"Baseline http_requests_total: {baseline}")
+
+    # 2. Random calls to /work?n=K
+    num_calls = random.randint(3, 6)
+    for i in range(num_calls):
+        k = random.randint(1, 50)
+        res = client.get(f"/work?n={k}")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["email"] == USER_EMAIL
+        assert data["done"] == k
+
+    print(f"Made {num_calls} calls to /work?n=K successfully.")
+
+    # 3. Read metrics again and verify counter increment
+    metrics_res2 = client.get("/metrics")
+    assert metrics_res2.status_code == 200
+    counter_after = parse_http_requests_total(metrics_res2.text)
+    delta = counter_after - baseline
+    print(f"New http_requests_total: {counter_after}, delta: {delta} (expected >= {num_calls})")
+    assert delta >= num_calls, f"Counter only increased by {delta}, expected at least {num_calls}"
+
+    # 4. Check /healthz
+    healthz_res = client.get("/healthz")
+    assert healthz_res.status_code == 200
+    h_data = healthz_res.json()
+    assert h_data.get("status") == "ok"
+    uptime = h_data.get("uptime_s")
+    assert isinstance(uptime, (int, float))
+    assert uptime >= 0.0
+    print(f"/healthz PASSED: status={h_data['status']}, uptime_s={uptime}")
+
+    # 5. Check /logs/tail
+    tail_res = client.get("/logs/tail?limit=10")
+    assert tail_res.status_code == 200
+    logs = tail_res.json()
+    assert isinstance(logs, list)
+    assert len(logs) > 0
+
+    required_keys = {"level", "ts", "path", "request_id"}
+    has_work_entry = False
+    for entry in logs:
+        assert isinstance(entry, dict)
+        for key in required_keys:
+            assert key in entry, f"Missing key '{key}' in log entry: {entry}"
+            assert entry[key] is not None and str(entry[key]).strip() != ""
+        if "/work" in entry["path"]:
+            has_work_entry = True
+
+    assert has_work_entry, f"No entry with path containing '/work' found in logs tail: {logs}"
+    print(f"/logs/tail PASSED: returned {len(logs)} entries, found /work entry.")
+
+    # 6. Test with varying limit parameter
+    tail_limit_3 = client.get("/logs/tail?limit=3")
+    assert tail_limit_3.status_code == 200
+    assert len(tail_limit_3.json()) <= 3
+
+    print("Question 8 tests PASSED successfully!\n")
+
+
 def test_question_3_stats():
     print("--- Running Question 3 (Stats & CORS) Tests ---")
-    # Preflight allowed origin
     res = client.options("/stats", headers={
         "Origin": ALLOWED_ORIGIN_STATS,
         "Access-Control-Request-Method": "GET",
@@ -37,7 +111,6 @@ def test_question_3_stats():
     assert "x-request-id" in res.headers
     assert "x-process-time" in res.headers
 
-    # Preflight evil origin
     res = client.options("/stats", headers={
         "Origin": "https://evil.attacker.com",
         "Access-Control-Request-Method": "GET",
@@ -46,7 +119,6 @@ def test_question_3_stats():
     assert "x-request-id" in res.headers
     assert "x-process-time" in res.headers
 
-    # GET /stats allowed origin
     res = client.get("/stats?values=10,20,30,40", headers={"Origin": ALLOWED_ORIGIN_STATS})
     assert res.status_code == 200
     assert res.headers.get("access-control-allow-origin") == ALLOWED_ORIGIN_STATS
@@ -58,7 +130,6 @@ def test_question_3_stats():
     assert data["max"] == 40
     assert abs(data["mean"] - 25.0) < 0.01
 
-    # GET /stats without origin header
     batch = [random.randint(-1000, 1000) for _ in range(50)]
     res = client.get(f"/stats?values={','.join(map(str, batch))}")
     assert res.status_code == 200
@@ -71,13 +142,11 @@ def test_question_3_stats():
 
 def test_question_4_verify():
     print("--- Running Question 4 (Token Verification) Tests ---")
-    # Temporarily patch IDP_PUBLIC_KEY with our test public key for testing
     orig_key = main.IDP_PUBLIC_KEY
     main.IDP_PUBLIC_KEY = test_pub_pem
     try:
         now = int(time.time())
 
-        # Probe 1: A freshly minted valid token
         valid_payload = {
             "iss": "https://idp.exam.local",
             "aud": "tds-e8pdjl8x.apps.exam.local",
@@ -96,9 +165,7 @@ def test_question_4_verify():
         assert data["sub"] == "user-abc-123"
         assert data["email"] == "test-user@exam.local"
         assert data["aud"] == "tds-e8pdjl8x.apps.exam.local"
-        print("Probe 1 (Valid token): PASSED ->", data)
 
-        # Probe 2: An expired token (exp in past)
         expired_payload = {
             "iss": "https://idp.exam.local",
             "aud": "tds-e8pdjl8x.apps.exam.local",
@@ -110,9 +177,7 @@ def test_question_4_verify():
         res = client.post("/verify", json={"token": expired_tok})
         assert res.status_code == 401
         assert res.json() == {"valid": False}
-        print("Probe 2 (Expired token): PASSED -> 401 rejected")
 
-        # Probe 3: A token with the wrong audience
         wrong_aud_payload = {
             "iss": "https://idp.exam.local",
             "aud": "some-other-audience.exam.local",
@@ -124,9 +189,7 @@ def test_question_4_verify():
         res = client.post("/verify", json={"token": wrong_aud_tok})
         assert res.status_code == 401
         assert res.json() == {"valid": False}
-        print("Probe 3 (Wrong audience): PASSED -> 401 rejected")
 
-        # Probe 4: A token with a tampered payload and invalid signature
         parts = valid_tok.split(".")
         tampered_body = base64.urlsafe_b64encode(
             b'{"iss":"https://idp.exam.local","aud":"tds-e8pdjl8x.apps.exam.local","sub":"hacker","exp":9999999999}'
@@ -135,9 +198,7 @@ def test_question_4_verify():
         res = client.post("/verify", json={"token": tampered_tok})
         assert res.status_code == 401
         assert res.json() == {"valid": False}
-        print("Probe 4 (Tampered token): PASSED -> 401 rejected")
 
-        # Extra: Wrong issuer
         wrong_iss_payload = {
             "iss": "https://attacker.idp.local",
             "aud": "tds-e8pdjl8x.apps.exam.local",
@@ -148,9 +209,7 @@ def test_question_4_verify():
         res = client.post("/verify", json={"token": wrong_iss_tok})
         assert res.status_code == 401
         assert res.json() == {"valid": False}
-        print("Extra (Wrong issuer): PASSED -> 401 rejected")
 
-        # Extra: Empty / malformed requests
         res = client.post("/verify", json={})
         assert res.status_code == 401
         assert res.json() == {"valid": False}
@@ -159,17 +218,13 @@ def test_question_4_verify():
         assert res.status_code == 401
         assert res.json() == {"valid": False}
 
-        # Extra: Preflight on /verify
         res = client.options("/verify", headers={"Origin": "https://exam.portal.local", "Access-Control-Request-Method": "POST"})
         assert res.status_code == 200
         assert res.headers.get("access-control-allow-origin") == "https://exam.portal.local"
-        print("Extra (Preflight on /verify): PASSED")
 
     finally:
         main.IDP_PUBLIC_KEY = orig_key
 
-    # Also test actual configured IDP_PUBLIC_KEY rejection of an unauthorized signature
-    # (signed with arbitrary key instead of configured real IDP key)
     unauthorized_tok = jwt.encode(
         {"iss": "https://idp.exam.local", "aud": "tds-e8pdjl8x.apps.exam.local", "exp": int(time.time()) + 3600},
         test_priv_pem,
@@ -178,14 +233,13 @@ def test_question_4_verify():
     res = client.post("/verify", json={"token": unauthorized_tok})
     assert res.status_code == 401
     assert res.json() == {"valid": False}
-    print("Real IDP public key verification against arbitrary key: PASSED -> 401 rejected")
+    print("Question 4 tests passed!")
 
 
 def test_question_7_analytics():
     print("--- Running Question 7 (POST Analytics Endpoint) Tests ---")
     api_key = "ak_dardxo7jihv44pvmrpzvpde7"
 
-    # Test 1: Preflight OPTIONS on /analytics
     res = client.options("/analytics", headers={
         "Origin": "https://exam.study.iitm.ac.in",
         "Access-Control-Request-Method": "POST",
@@ -193,20 +247,14 @@ def test_question_7_analytics():
     })
     assert res.status_code == 200
     assert res.headers.get("access-control-allow-origin") == "https://exam.study.iitm.ac.in"
-    print("Test 1 (CORS Preflight on /analytics): PASSED")
 
-    # Test 2: Missing API key -> 401
     sample_events = {"events": [{"user": "alice", "amount": 42.5, "ts": 1700000000}]}
     res = client.post("/analytics", json=sample_events)
     assert res.status_code == 401
-    print("Test 2 (Missing API key -> 401): PASSED")
 
-    # Test 3: Wrong API key -> 401
     res = client.post("/analytics", json=sample_events, headers={"X-API-Key": "wrong_key_123"})
     assert res.status_code == 401
-    print("Test 3 (Wrong API key -> 401): PASSED")
 
-    # Test 4: Valid key with sample from problem description
     res = client.post("/analytics", json=sample_events, headers={"X-API-Key": api_key})
     assert res.status_code == 200
     data = res.json()
@@ -215,10 +263,7 @@ def test_question_7_analytics():
     assert data["unique_users"] == 1
     assert data["revenue"] == 42.5
     assert data["top_user"] == "alice"
-    print("Test 4 (Single event): PASSED ->", data)
 
-    # Test 5: Randomized batch with 8-17 events, 4-7 users, mixed positive/negative amounts
-    users = ["alice", "bob", "carol", "dave", "eve"]
     events = [
         {"user": "alice", "amount": 50.0, "ts": 1700000001},
         {"user": "bob", "amount": -20.0, "ts": 1700000002},
@@ -226,21 +271,11 @@ def test_question_7_analytics():
         {"user": "dave", "amount": 0.0, "ts": 1700000004},
         {"user": "eve", "amount": 10.25, "ts": 1700000005},
         {"user": "alice", "amount": 30.0, "ts": 1700000006},
-        {"user": "bob", "amount": 200.0, "ts": 1700000007},  # bob's positive is 200.0
+        {"user": "bob", "amount": 200.0, "ts": 1700000007},
         {"user": "carol", "amount": -50.0, "ts": 1700000008},
         {"user": "dave", "amount": 15.0, "ts": 1700000009},
         {"user": "eve", "amount": -5.0, "ts": 1700000010},
     ]
-    # Total events: 10
-    # Unique users: 5 (alice, bob, carol, dave, eve)
-    # Positive amounts:
-    # alice: 50.0 + 30.0 = 80.0
-    # bob: 200.0 (the -20.0 is ignored)
-    # carol: 100.5 (the -50.0 is ignored)
-    # dave: 15.0 (0.0 ignored)
-    # eve: 10.25 (-5.0 ignored)
-    # Revenue: 80.0 + 200.0 + 100.5 + 15.0 + 10.25 = 405.75
-    # Top user: bob (200.0)
 
     res = client.post("/analytics", json={"events": events}, headers={
         "X-API-Key": api_key,
@@ -254,10 +289,8 @@ def test_question_7_analytics():
     assert data["unique_users"] == 5
     assert abs(data["revenue"] - 405.75) < 1e-4
     assert data["top_user"] == "bob"
-    print("Test 5 (Mixed batch): PASSED ->", data)
 
-    # Test 6: 15 randomized events generator to simulate grader Probe
-    for probe_idx in range(5):
+    for _ in range(5):
         probe_users = [f"user_{i}" for i in range(random.randint(4, 7))]
         n_events = random.randint(8, 17)
         batch = []
@@ -271,7 +304,6 @@ def test_question_7_analytics():
                 user_pos[u] += amt
                 expected_rev += amt
 
-        # Ensure no tie by bumping one user slightly if needed
         sorted_pos = sorted(user_pos.items(), key=lambda x: x[1], reverse=True)
         if len(sorted_pos) >= 2 and abs(sorted_pos[0][1] - sorted_pos[1][1]) < 0.01:
             batch.append({"user": sorted_pos[0][0], "amount": 10.0, "ts": int(time.time())})
@@ -288,10 +320,12 @@ def test_question_7_analytics():
         assert d["unique_users"] == len(set(e["user"] for e in batch))
         assert abs(d["revenue"] - expected_rev) < 0.05
         assert d["top_user"] == expected_top
-    print("Test 6 (Randomized probes simulation): PASSED")
+
+    print("Question 7 tests passed!")
 
 
 if __name__ == "__main__":
+    test_question_8_observability()
     test_question_3_stats()
     test_question_4_verify()
     test_question_7_analytics()
