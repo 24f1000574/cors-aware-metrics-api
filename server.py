@@ -162,6 +162,16 @@ def authenticate_and_validate(request: Request) -> str:
             detail="Unsupported or missing A2A-Version. Expected 1.0."
         )
 
+    # 3. Check Content-Type for POST requests: require application/a2a+json
+    if request.method == "POST":
+        ct = request.headers.get("content-type") or request.headers.get("Content-Type") or ""
+        media_type = ct.split(";")[0].strip().lower()
+        if media_type != "application/a2a+json":
+            raise HTTPException(
+                status_code=415,
+                detail="Unsupported Media Type. Expected Content-Type: application/a2a+json"
+            )
+
     return token
 
 # ----------------- Discovery & Root Routes -----------------
