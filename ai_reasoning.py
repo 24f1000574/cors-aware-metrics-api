@@ -20,9 +20,6 @@ if os.path.exists(env_path):
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
 VALID_ACTIONS = {
     "settle_invoice",
     "request_approval",
@@ -30,6 +27,23 @@ VALID_ACTIONS = {
     "reject_duplicate",
     "open_exception"
 }
+
+def get_package_text(pkg: Any) -> str:
+    """Extracts all text contents from a package object cleanly, preserving newlines."""
+    if isinstance(pkg, str):
+        return pkg
+    parts = []
+    def recurse(val):
+        if isinstance(val, str):
+            parts.append(val)
+        elif isinstance(val, dict):
+            for v in val.values():
+                recurse(v)
+        elif isinstance(val, list):
+            for v in val:
+                recurse(v)
+    recurse(pkg)
+    return "\n\n".join(parts)
 
 def extract_bracketed_refs(text: str) -> List[str]:
     """Finds all bracketed references like [DOC-123], [REF-456] preserving brackets."""
@@ -40,7 +54,6 @@ def find_decisive_paragraph_and_refs(text: str) -> Tuple[str, List[str]]:
     Finds the paragraph that has exactly three decisive bracketed references,
     excluding cover-sheets, archive examples, and decoys.
     """
-    # Normalize escaped newlines
     normalized_text = text.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n')
     paragraphs = re.split(r'\n\s*\n', normalized_text)
     if len(paragraphs) <= 1:
@@ -75,7 +88,21 @@ def find_decisive_paragraph_and_refs(text: str) -> Tuple[str, List[str]]:
                 return (para, u_refs)
         return candidates[0]
     
-    # Fallback: scan any paragraph with 3 refs
+    # Sentence-level scanning if paragraph contains mixed text
+    sentences = re.split(r'(?<=[.!?])\s+', normalized_text)
+    for s in sentences:
+        s_lower = s.lower()
+        if any(term in s_lower for term in ["cover sheet", "archive", "decoy", "example only"]):
+            continue
+        refs = extract_bracketed_refs(s)
+        unique_refs = []
+        for r in refs:
+            if r not in unique_refs:
+                unique_refs.append(r)
+        if len(unique_refs) == 3:
+            return (s, unique_refs)
+
+    # Secondary fallback: any paragraph with 3 refs
     for para in paragraphs:
         refs = extract_bracketed_refs(para)
         unique_refs = []
@@ -85,7 +112,7 @@ def find_decisive_paragraph_and_refs(text: str) -> Tuple[str, List[str]]:
         if len(unique_refs) == 3:
             return (para, unique_refs)
 
-    # Secondary fallback: all unique refs from text
+    # Last resort fallback: all unique refs
     all_refs = []
     for r in extract_bracketed_refs(normalized_text):
         if r not in all_refs:
@@ -152,29 +179,57 @@ def format_rationale(action: str, refs: List[str], base_rationale: str = "") -> 
     return rat
 
 def heuristic_classify_paragraph(para: str, raw_text: str) -> str:
-    """Fast deterministic rule classification of the decisive paragraph."""
-    text_lower = (para or raw_text).lower()
-    if "duplicate" in text_lower or "already paid" in text_lower or "previously settled" in text_lower or "prior payment" in text_lower:
+    """
+    Precise deterministic rule classification of the decisive paragraph,
+    preventing improper settle_invoice defaults.
+    """
+    text_to_check = (para if len(para.strip()) > 15 else raw_text).lower()
+    
+    # 1. Duplicate
+    if any(k in text_to_check for k in [
+        "duplicate", "already paid", "previously paid", "prior payment",
+        "already settled", "previously settled", "prior transaction", "same invoice already"
+    ]):
         return "reject_duplicate"
-    elif "exception" in text_lower or "conflict" in text_lower or "mismatch" in text_lower or "discrepancy" in text_lower or "price variance" in text_lower:
+        
+    # 2. Exception (conflict/mismatch)
+    if any(k in text_to_check for k in [
+        "conflict", "mismatch", "discrepancy", "variance", "exception workflow",
+        "tax mismatch", "tin mismatch", "gstin mismatch", "bank details mismatch"
+    ]):
         return "open_exception"
-    elif "hold" in text_lower or "pause" in text_lower or "pauses" in text_lower or "pending verification" in text_lower or "awaiting" in text_lower or "inspection" in text_lower:
+        
+    # 3. Hold (pauses / verification incomplete)
+    if any(k in text_to_check for k in [
+        "pause", "pauses", "hold", "pending verification", "pending inspection",
+        "awaiting delivery", "awaiting inspection", "verification completes", "on hold"
+    ]):
         return "hold_invoice"
-    elif "approval" in text_lower or "authority" in text_lower or "delegat" in text_lower or "exceeds" in text_lower or "above threshold" in text_lower or "escalate" in text_lower:
+        
+    # 4. Approval (outside authority threshold)
+    if any(k in text_to_check for k in [
+        "outside delegated", "outside autonomous", "outside authority", "exceeds",
+        "above threshold", "approval required", "requires manager", "requires approval",
+        "escalate", "outside limit"
+    ]):
         return "request_approval"
-    else:
-        return "settle_invoice"
+        
+    # 5. Settle
+    return "settle_invoice"
 
 def heuristic_parse_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     """Fallback heuristic parser if LLM call fails or times out."""
     pkg_id = pkg.get("packageId") or pkg.get("id") or str(uuid.uuid4())
-    raw_text = json.dumps(pkg) if not isinstance(pkg, str) else pkg
+    full_text = get_package_text(pkg)
+    raw_json = json.dumps(pkg)
     
-    para, refs = find_decisive_paragraph_and_refs(raw_text)
-    facts = extract_facts(pkg, raw_text)
-    action = heuristic_classify_paragraph(para, raw_text)
+    para, refs = find_decisive_paragraph_and_refs(full_text)
+    if not para:
+        para, refs = find_decisive_paragraph_and_refs(raw_json)
+        
+    facts = extract_facts(pkg, full_text or raw_json)
+    action = heuristic_classify_paragraph(para, full_text or raw_json)
     
-    # Ensure exactly 3 refs
     normalized_refs = []
     for r in refs:
         r_str = str(r).strip()
@@ -198,17 +253,23 @@ def heuristic_parse_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 def call_llm_batch(packages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Batches multiple packages into one concise model call.
-    Only the decisive paragraph, facts, and refs are sent (compact < 1000 tokens),
-    avoiding Groq 7k ITPM rate limit and keeping response latency under 1 second.
+    Only decisive paragraphs and facts are sent, and the LLM returns ONLY
+    [{"packageId": "...", "action": "..."}] (<150 output tokens),
+    avoiding all OTPM rate limits while preserving high-accuracy reasoning.
     """
     compact_packages = []
     pre_extracted = []
 
     for pkg in packages:
         pkg_id = pkg.get("packageId") or pkg.get("id") or str(uuid.uuid4())
-        raw_text = json.dumps(pkg) if not isinstance(pkg, str) else pkg
-        para, refs = find_decisive_paragraph_and_refs(raw_text)
-        facts = extract_facts(pkg, raw_text)
+        full_text = get_package_text(pkg)
+        raw_json = json.dumps(pkg)
+        
+        para, refs = find_decisive_paragraph_and_refs(full_text)
+        if not para:
+            para, refs = find_decisive_paragraph_and_refs(raw_json)
+            
+        facts = extract_facts(pkg, full_text or raw_json)
         
         normalized_refs = []
         for r in refs:
@@ -223,42 +284,36 @@ def call_llm_batch(packages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         pre_extracted.append({
             "packageId": pkg_id,
             "facts": facts,
-            "decisiveParagraph": para if para else raw_text[:300],
+            "decisiveParagraph": para if para else (full_text[:300] or raw_json[:300]),
             "evidenceRefs": refs,
-            "rawText": raw_text
+            "rawText": full_text or raw_json
         })
         compact_packages.append({
             "packageId": pkg_id,
             "facts": facts,
-            "decisiveParagraph": para if para else raw_text[:300],
+            "decisiveParagraph": para if para else (full_text[:300] or raw_json[:300]),
             "evidenceRefs": refs
         })
 
     system_content = """You are an expert accounts payable invoice auditor following corporate finance policy.
-You are given a JSON array of invoice packages, each with its extracted decisive paragraph, facts, and 3 evidence references.
-For EACH package in the array, choose exactly ONE typed action:
+Choose exactly ONE typed action for each package:
 - "settle_invoice": valid, reconciled, and within autonomous authority.
 - "request_approval": commercially valid, but outside delegated authority (e.g. exceeds authority threshold).
 - "hold_invoice": payment pauses until a stated verification completes.
 - "reject_duplicate": the same commercial invoice was already paid.
 - "open_exception": material records conflict and need an exception workflow.
 
-Return a JSON array of proposal objects matching:
-[
-  {
-    "packageId": "...",
-    "action": "one of the 5 exact actions above",
-    "rationale": "60-1500 chars naming the action and citing at least two evidence refs"
-  }
-]
-Return ONLY valid JSON array."""
+Return a JSON array of objects with ONLY packageId and action:
+[{"packageId": "...", "action": "..."}]
+Return ONLY raw valid JSON."""
 
     user_content = json.dumps(compact_packages)
 
     configs = [
-        # Provider 1: Ultra-fast Groq with strict 8.0s timeout
-        (GROQ_URL, GROQ_API_KEY, "qwen/qwen3.8-27b", 8.0),
-        (GROQ_URL, GROQ_API_KEY, "openai/gpt-oss-20b", 8.0),
+        # Provider 1: Ultra-fast Groq models with low max_tokens (<=250)
+        (GROQ_URL, GROQ_API_KEY, "openai/gpt-oss-120b", 7.0),
+        (GROQ_URL, GROQ_API_KEY, "qwen/qwen3.8-27b", 7.0),
+        (GROQ_URL, GROQ_API_KEY, "openai/gpt-oss-20b", 7.0),
     ]
 
     for url, key, model_name, timeout in configs:
@@ -278,7 +333,8 @@ Return ONLY valid JSON array."""
                             {"role": "system", "content": system_content},
                             {"role": "user", "content": user_content}
                         ],
-                        "temperature": 0.1
+                        "max_tokens": 250,
+                        "temperature": 0.0
                     }
                 )
                 if resp.status_code == 200:
@@ -301,7 +357,7 @@ Return ONLY valid JSON array."""
                                 
                             facts = pre["facts"]
                             refs = pre["evidenceRefs"]
-                            rat = format_rationale(act, refs, str(p.get("rationale", "")))
+                            rat = format_rationale(act, refs)
                             
                             validated.append({
                                 "packageId": orig_id,
@@ -310,11 +366,15 @@ Return ONLY valid JSON array."""
                                 "evidenceRefs": refs,
                                 "rationale": rat
                             })
+                        print(f"LLM {model_name} successfully classified {len(validated)} packages.")
+                        sys.stdout.flush()
                         return validated
                 else:
-                    print(f"LLM {model_name} HTTP {resp.status_code}: {resp.text[:200]}")
+                    print(f"LLM {model_name} HTTP {resp.status_code}: {resp.text[:150]}")
+                    sys.stdout.flush()
         except Exception as e:
             print(f"Error calling {model_name} on {url}: {e}")
+            sys.stdout.flush()
             continue
 
     print("All LLM attempts bypassed or failed. Using fast deterministic rule reasoning.")
