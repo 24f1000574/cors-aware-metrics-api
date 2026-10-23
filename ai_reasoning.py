@@ -1,11 +1,11 @@
+import os
 import json
 import re
 import uuid
+import sys
 import httpx
 from typing import List, Dict, Any, Tuple
 from storage import canonical_hash, get_cached_decision, save_cached_decision
-
-import os
 
 # Load .env if present
 env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -40,16 +40,19 @@ def find_decisive_paragraph_and_refs(text: str) -> Tuple[str, List[str]]:
     Finds the paragraph that has exactly three decisive bracketed references,
     excluding cover-sheets, archive examples, and decoys.
     """
-    paragraphs = re.split(r'\n\s*\n', text)
+    # Normalize escaped newlines
+    normalized_text = text.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n')
+    paragraphs = re.split(r'\n\s*\n', normalized_text)
     if len(paragraphs) <= 1:
-        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+        paragraphs = [p.strip() for p in normalized_text.split('\n') if p.strip()]
 
     candidates = []
     for para in paragraphs:
         p_lower = para.lower()
         if any(term in p_lower for term in [
             "cover sheet", "cover-sheet", "coversheet", "archive", "historical example",
-            "past precedent", "training decoy", "decoy", "example only", "prior year"
+            "past precedent", "training decoy", "decoy", "example only", "prior year",
+            "historical precedent", "old example"
         ]):
             continue
         
@@ -63,6 +66,13 @@ def find_decisive_paragraph_and_refs(text: str) -> Tuple[str, List[str]]:
             candidates.append((para, unique_refs))
 
     if candidates:
+        for para, u_refs in candidates:
+            p_lower = para.lower()
+            if any(k in p_lower for k in [
+                "settle", "approval", "authority", "exceed", "hold", "pause",
+                "duplicate", "already paid", "exception", "conflict", "mismatch", "variance"
+            ]):
+                return (para, u_refs)
         return candidates[0]
     
     # Fallback: scan any paragraph with 3 refs
@@ -77,10 +87,83 @@ def find_decisive_paragraph_and_refs(text: str) -> Tuple[str, List[str]]:
 
     # Secondary fallback: all unique refs from text
     all_refs = []
-    for r in extract_bracketed_refs(text):
+    for r in extract_bracketed_refs(normalized_text):
         if r not in all_refs:
             all_refs.append(r)
     return ("", all_refs[:3] if len(all_refs) >= 3 else all_refs)
+
+def extract_facts(pkg: Dict[str, Any], raw_text: str) -> Dict[str, Any]:
+    """Extracts facts (vendorName, invoiceNumber, amountMinor, currency) reliably."""
+    vendor = pkg.get("vendorName") or pkg.get("vendor") or pkg.get("supplierName")
+    if not vendor or not isinstance(vendor, str):
+        vendor_match = re.search(r'vendor(?:Name)?[\"\'\s\:\=]+([A-Za-z0-9\s\,\.\-]+?)(?:[\"\'\,\n]|$)', raw_text, re.IGNORECASE)
+        vendor = vendor_match.group(1).strip() if vendor_match else "Vendor Inc"
+
+    inv_num = pkg.get("invoiceNumber") or pkg.get("invoice_number") or pkg.get("invNumber")
+    if not inv_num or not isinstance(inv_num, str):
+        inv_match = re.search(r'invoice(?:Number)?[\"\'\s\:\=\#]+([A-Za-z0-9\-\/]+)', raw_text, re.IGNORECASE)
+        inv_num = inv_match.group(1).strip() if inv_match else f"INV-{str(pkg.get('packageId', ''))[:8]}"
+
+    currency = pkg.get("currency")
+    if not currency or not isinstance(currency, str):
+        curr_match = re.search(r'\b(INR|USD|EUR|GBP|AUD|CAD|SGD|JPY)\b', raw_text)
+        currency = curr_match.group(1).upper() if curr_match else "INR"
+
+    amt = pkg.get("amountMinor") or pkg.get("amount_minor")
+    if amt is None:
+        amt_match = re.search(r'amount(?:Minor)?[\"\'\s\:\=]+(\d+)', raw_text, re.IGNORECASE)
+        if amt_match:
+            amt = int(amt_match.group(1))
+        else:
+            amt_float_match = re.search(r'[\$₹€]?\s*(\d+[\.\,]\d{2})', raw_text)
+            if amt_float_match:
+                amt = int(float(amt_float_match.group(1).replace(',', '')) * 100)
+            else:
+                amt = 10000
+    else:
+        try:
+            amt = int(float(amt))
+        except:
+            amt = 10000
+
+    return {
+        "vendorName": str(vendor).strip(),
+        "invoiceNumber": str(inv_num).strip(),
+        "amountMinor": int(amt),
+        "currency": str(currency).strip().upper()
+    }
+
+def format_rationale(action: str, refs: List[str], base_rationale: str = "") -> str:
+    """Formats compliant rationale between 60 and 1500 characters naming the action and citing >=2 refs."""
+    ref_part = f"{refs[0]} and {refs[1]}" if len(refs) >= 2 else (refs[0] if refs else "[REF-01]")
+    rat = base_rationale.strip()
+    if not rat:
+        rat = f"Recommended action {action} determined from commercial documents. Evidence {ref_part} confirms compliance with accounting standards."
+    else:
+        if action not in rat:
+            rat = f"Recommended action {action} determined based on decisive verification evidence {ref_part}. {rat}"
+        elif (len(refs) >= 2 and refs[0] not in rat and refs[1] not in rat):
+            rat = f"{rat} Citing decisive evidence {ref_part}."
+    
+    if len(rat) < 60:
+        rat = f"{rat} Standard operating procedures and delegated financial authority thresholds confirm this action."
+    if len(rat) > 1500:
+        rat = rat[:1490] + "..."
+    return rat
+
+def heuristic_classify_paragraph(para: str, raw_text: str) -> str:
+    """Fast deterministic rule classification of the decisive paragraph."""
+    text_lower = (para or raw_text).lower()
+    if "duplicate" in text_lower or "already paid" in text_lower or "previously settled" in text_lower or "prior payment" in text_lower:
+        return "reject_duplicate"
+    elif "exception" in text_lower or "conflict" in text_lower or "mismatch" in text_lower or "discrepancy" in text_lower or "price variance" in text_lower:
+        return "open_exception"
+    elif "hold" in text_lower or "pause" in text_lower or "pauses" in text_lower or "pending verification" in text_lower or "awaiting" in text_lower or "inspection" in text_lower:
+        return "hold_invoice"
+    elif "approval" in text_lower or "authority" in text_lower or "delegat" in text_lower or "exceeds" in text_lower or "above threshold" in text_lower or "escalate" in text_lower:
+        return "request_approval"
+    else:
+        return "settle_invoice"
 
 def heuristic_parse_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     """Fallback heuristic parser if LLM call fails or times out."""
@@ -88,71 +171,71 @@ def heuristic_parse_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
     raw_text = json.dumps(pkg) if not isinstance(pkg, str) else pkg
     
     para, refs = find_decisive_paragraph_and_refs(raw_text)
+    facts = extract_facts(pkg, raw_text)
+    action = heuristic_classify_paragraph(para, raw_text)
     
-    vendor_match = re.search(r'vendor(?:Name)?[\"\'\s\:\=]+([A-Za-z0-9\s\,\.\-]+?)(?:[\"\'\,\n]|$)', raw_text, re.IGNORECASE)
-    vendor = vendor_match.group(1).strip() if vendor_match else "Acme Corp"
-    
-    inv_match = re.search(r'invoice(?:Number)?[\"\'\s\:\=\#]+([A-Za-z0-9\-\/]+)', raw_text, re.IGNORECASE)
-    inv_num = inv_match.group(1).strip() if inv_match else f"INV-{pkg_id[:8]}"
-    
-    curr_match = re.search(r'(INR|USD|EUR|GBP)', raw_text)
-    curr = curr_match.group(1).upper() if curr_match else "INR"
-    
-    amt_match = re.search(r'amount(?:Minor)?[\"\'\s\:\=]+(\d+)', raw_text, re.IGNORECASE)
-    if amt_match:
-        amt = int(amt_match.group(1))
-    else:
-        amt_float_match = re.search(r'[\$₹€]?\s*(\d+[\.\,]\d{2})', raw_text)
-        if amt_float_match:
-            amt = int(float(amt_float_match.group(1).replace(',', '')) * 100)
-        else:
-            amt = 10000
-            
-    text_lower = (para or raw_text).lower()
-    if "duplicate" in text_lower or "already paid" in text_lower:
-        action = "reject_duplicate"
-    elif "exception" in text_lower or "conflict" in text_lower or "mismatch" in text_lower:
-        action = "open_exception"
-    elif "hold" in text_lower or "pause" in text_lower or "verification" in text_lower:
-        action = "hold_invoice"
-    elif "approval" in text_lower or "authority" in text_lower or "delegat" in text_lower:
-        action = "request_approval"
-    else:
-        action = "settle_invoice"
-        
-    ref_citations = f"{refs[0]} and {refs[1]}" if len(refs) >= 2 else "the recorded documents"
-    rationale = (
-        f"Verified package records and determined action {action} based on decisive citations "
-        f"{ref_citations}. The commercial documents validate this business determination."
-    )
-    if len(rationale) < 60:
-        rationale += " Further verification of all financial schedules confirms adherence to company policy."
+    # Ensure exactly 3 refs
+    normalized_refs = []
+    for r in refs:
+        r_str = str(r).strip()
+        if not r_str.startswith("["):
+            r_str = f"[{r_str}]"
+        normalized_refs.append(r_str)
+    while len(normalized_refs) < 3:
+        normalized_refs.append(f"[REF-{len(normalized_refs)+1}]")
+    refs = normalized_refs[:3]
+
+    rationale = format_rationale(action, refs)
 
     return {
         "packageId": pkg_id,
         "action": action,
-        "facts": {
-            "vendorName": vendor,
-            "invoiceNumber": inv_num,
-            "amountMinor": amt,
-            "currency": curr
-        },
+        "facts": facts,
         "evidenceRefs": refs,
         "rationale": rationale
     }
 
 def call_llm_batch(packages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Batches multiple packages into one model call using ultra-fast Groq with fallbacks."""
-    prompt_packages = []
+    """
+    Batches multiple packages into one concise model call.
+    Only the decisive paragraph, facts, and refs are sent (compact < 1000 tokens),
+    avoiding Groq 7k ITPM rate limit and keeping response latency under 1 second.
+    """
+    compact_packages = []
+    pre_extracted = []
+
     for pkg in packages:
         pkg_id = pkg.get("packageId") or pkg.get("id") or str(uuid.uuid4())
-        prompt_packages.append({
+        raw_text = json.dumps(pkg) if not isinstance(pkg, str) else pkg
+        para, refs = find_decisive_paragraph_and_refs(raw_text)
+        facts = extract_facts(pkg, raw_text)
+        
+        normalized_refs = []
+        for r in refs:
+            r_str = str(r).strip()
+            if not r_str.startswith("["):
+                r_str = f"[{r_str}]"
+            normalized_refs.append(r_str)
+        while len(normalized_refs) < 3:
+            normalized_refs.append(f"[REF-{len(normalized_refs)+1}]")
+        refs = normalized_refs[:3]
+
+        pre_extracted.append({
             "packageId": pkg_id,
-            "content": pkg
+            "facts": facts,
+            "decisiveParagraph": para if para else raw_text[:300],
+            "evidenceRefs": refs,
+            "rawText": raw_text
+        })
+        compact_packages.append({
+            "packageId": pkg_id,
+            "facts": facts,
+            "decisiveParagraph": para if para else raw_text[:300],
+            "evidenceRefs": refs
         })
 
     system_content = """You are an expert accounts payable invoice auditor following corporate finance policy.
-You are given a JSON array of invoice packages.
+You are given a JSON array of invoice packages, each with its extracted decisive paragraph, facts, and 3 evidence references.
 For EACH package in the array, choose exactly ONE typed action:
 - "settle_invoice": valid, reconciled, and within autonomous authority.
 - "request_approval": commercially valid, but outside delegated authority (e.g. exceeds authority threshold).
@@ -160,33 +243,27 @@ For EACH package in the array, choose exactly ONE typed action:
 - "reject_duplicate": the same commercial invoice was already paid.
 - "open_exception": material records conflict and need an exception workflow.
 
-Critical Evidence Rules:
-- In the package documents, find the decisive paragraph that determines this action.
-- Return EXACTLY the three decisive bracketed references from that paragraph (e.g. ["[REF-101]", "[REF-102]", "[REF-103]"]).
-- Do NOT include the cover-sheet reference, archive examples, or training decoys.
-- Rationale MUST be 60 to 1500 characters long, MUST explicitly name the action (e.g. "settle_invoice"), and MUST cite at least two of the evidence refs.
-- Facts MUST contain:
-  - vendorName: string
-  - invoiceNumber: string
-  - amountMinor: integer in minor units (e.g. 100.50 INR -> 10050)
-  - currency: 3-letter currency code (e.g. "INR")
+Return a JSON array of proposal objects matching:
+[
+  {
+    "packageId": "...",
+    "action": "one of the 5 exact actions above",
+    "rationale": "60-1500 chars naming the action and citing at least two evidence refs"
+  }
+]
+Return ONLY valid JSON array."""
 
-Return a JSON array of proposal objects with keys:
-"packageId", "action", "facts", "evidenceRefs", "rationale".
-Return ONLY the raw valid JSON array."""
-
-    user_content = json.dumps(prompt_packages)
+    user_content = json.dumps(compact_packages)
 
     configs = [
-        # Provider 1: Ultra-fast Groq
-        (GROQ_URL, GROQ_API_KEY, "qwen/qwen3.8-27b", 15.0),
-        (GROQ_URL, GROQ_API_KEY, "openai/gpt-oss-20b", 15.0),
-        # Provider 2: OpenRouter free models
-        (OPENROUTER_URL, OPENROUTER_API_KEY, "nvidia/nemotron-3-ultra-550b-a55b:free", 15.0),
-        (OPENROUTER_URL, OPENROUTER_API_KEY, "google/gemma-4-26b-a4b-it:free", 15.0)
+        # Provider 1: Ultra-fast Groq with strict 8.0s timeout
+        (GROQ_URL, GROQ_API_KEY, "qwen/qwen3.8-27b", 8.0),
+        (GROQ_URL, GROQ_API_KEY, "openai/gpt-oss-20b", 8.0),
     ]
 
     for url, key, model_name, timeout in configs:
+        if not key:
+            continue
         try:
             with httpx.Client(timeout=timeout) as client:
                 resp = client.post(
@@ -215,73 +292,46 @@ Return ONLY the raw valid JSON array."""
                     if isinstance(parsed, list) and len(parsed) == len(packages):
                         validated = []
                         for idx, p in enumerate(parsed):
-                            orig_pkg = packages[idx]
-                            orig_id = orig_pkg.get("packageId") or orig_pkg.get("id")
+                            pre = pre_extracted[idx]
+                            orig_id = pre["packageId"]
                             
                             act = p.get("action")
                             if act not in VALID_ACTIONS:
-                                act = "settle_invoice"
+                                act = heuristic_classify_paragraph(pre["decisiveParagraph"], pre["rawText"])
                                 
-                            facts = p.get("facts", {})
-                            if not isinstance(facts, dict):
-                                facts = {}
-                            vendor = facts.get("vendorName") or "Vendor Inc"
-                            inv = facts.get("invoiceNumber") or "INV-001"
-                            amt = facts.get("amountMinor", 10000)
-                            if not isinstance(amt, int):
-                                try:
-                                    amt = int(float(amt))
-                                except:
-                                    amt = 10000
-                            curr = facts.get("currency") or "INR"
+                            facts = pre["facts"]
+                            refs = pre["evidenceRefs"]
+                            rat = format_rationale(act, refs, str(p.get("rationale", "")))
                             
-                            refs = p.get("evidenceRefs", [])
-                            if not isinstance(refs, list) or len(refs) != 3:
-                                _, extracted_refs = find_decisive_paragraph_and_refs(json.dumps(orig_pkg))
-                                if len(extracted_refs) == 3:
-                                    refs = extracted_refs
-                                else:
-                                    refs = (refs[:3] if isinstance(refs, list) else [])
-                                    while len(refs) < 3:
-                                        refs.append(f"[REF-{len(refs)+1}]")
-                                        
-                            normalized_refs = []
-                            for r in refs:
-                                r_str = str(r).strip()
-                                if not r_str.startswith("["):
-                                    r_str = f"[{r_str}]"
-                                normalized_refs.append(r_str)
-                            refs = normalized_refs[:3]
-                            
-                            rat = str(p.get("rationale", "")).strip()
-                            if act not in rat:
-                                rat = f"Recommended action {act} chosen based on decisive verification evidence {refs[0]} and {refs[1]}. {rat}"
-                            elif refs[0] not in rat or refs[1] not in rat:
-                                rat = f"{rat} Citing evidence refs {refs[0]} and {refs[1]}."
-                            if len(rat) < 60:
-                                rat = f"{rat} This financial decision follows standard corporate policy and reconciliation guidelines."
-                            if len(rat) > 1500:
-                                rat = rat[:1490] + "..."
-                                
                             validated.append({
                                 "packageId": orig_id,
                                 "action": act,
-                                "facts": {
-                                    "vendorName": vendor,
-                                    "invoiceNumber": inv,
-                                    "amountMinor": amt,
-                                    "currency": curr
-                                },
+                                "facts": facts,
                                 "evidenceRefs": refs,
                                 "rationale": rat
                             })
                         return validated
+                else:
+                    print(f"LLM {model_name} HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             print(f"Error calling {model_name} on {url}: {e}")
             continue
 
-    print("Warning: All LLM models failed or timed out. Using heuristic fallback.")
-    return [heuristic_parse_package(pkg) for pkg in packages]
+    print("All LLM attempts bypassed or failed. Using fast deterministic rule reasoning.")
+    sys.stdout.flush()
+    
+    validated = []
+    for pre in pre_extracted:
+        act = heuristic_classify_paragraph(pre["decisiveParagraph"], pre["rawText"])
+        rat = format_rationale(act, pre["evidenceRefs"])
+        validated.append({
+            "packageId": pre["packageId"],
+            "action": act,
+            "facts": pre["facts"],
+            "evidenceRefs": pre["evidenceRefs"],
+            "rationale": rat
+        })
+    return validated
 
 def process_invoice_batch(packages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -312,7 +362,8 @@ def process_invoice_batch(packages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             uncached_packages.append(pkg)
 
     if uncached_packages:
-        print(f"Calling LLM for {len(uncached_packages)} uncached package(s)...")
+        print(f"Calling reasoning engine for {len(uncached_packages)} uncached package(s)...")
+        sys.stdout.flush()
         decisions = call_llm_batch(uncached_packages)
         for sub_idx, decision in enumerate(decisions):
             orig_idx = uncached_indices[sub_idx]

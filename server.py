@@ -1,4 +1,6 @@
 import os
+import re
+import sys
 import json
 import uuid
 import asyncio
@@ -6,9 +8,8 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, Request, Response, HTTPException, status
-import uvicorn
-
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 from storage import (
     init_db,
@@ -23,6 +24,15 @@ from ai_reasoning import process_invoice_batch
 
 app = FastAPI(title="A2A Invoice Agent")
 
+# Normalize duplicate consecutive slashes so both /a2a/path and /a2a//path work
+@app.middleware("http")
+async def normalize_path_middleware(request: Request, call_next):
+    path = request.scope.get("path", "")
+    normalized_path = re.sub(r'/+', '/', path)
+    if normalized_path != path:
+        request.scope["path"] = normalized_path
+    return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,13 +46,30 @@ app.add_middleware(
 def on_startup():
     init_db()
 
+def a2a_response(content: Any, status_code: int = 200) -> Response:
+    body = json.dumps(content, separators=(',', ':'))
+    return Response(
+        content=body,
+        status_code=status_code,
+        media_type="application/a2a+json",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "Authorization, A2A-Version, Content-Type, Accept",
+        }
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return a2a_response({"error": exc.detail}, status_code=exc.status_code)
+
 @app.options("/{full_path:path}")
 async def options_preflight(full_path: str):
     return Response(
         status_code=200,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
             "Access-Control-Allow-Headers": "Authorization, A2A-Version, Content-Type, Accept",
         }
     )
@@ -69,6 +96,7 @@ def get_base_url(request: Request) -> str:
     return f"{scheme}://{host}/a2a"
 
 def build_agent_card(base_url: str) -> Dict[str, Any]:
+    clean_base = base_url.rstrip("/")
     return {
         "name": "Invoice Action Agent",
         "description": "Safe A2A 1.0 autonomous agent for invoice package verification, action proposals, and receipt settlement.",
@@ -94,25 +122,17 @@ def build_agent_card(base_url: str) -> Dict[str, Any]:
         ],
         "supportedInterfaces": [
             {
-                "url": base_url,
+                "url": clean_base,
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0"
+            },
+            {
+                "url": f"{clean_base}/",
                 "protocolBinding": "HTTP+JSON",
                 "protocolVersion": "1.0"
             }
         ]
     }
-
-def a2a_response(content: Any, status_code: int = 200) -> Response:
-    body = json.dumps(content, separators=(',', ':'))
-    return Response(
-        content=body,
-        status_code=status_code,
-        media_type="application/a2a+json",
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, A2A-Version, Content-Type, Accept",
-        }
-    )
 
 def authenticate_and_validate(request: Request) -> str:
     """
@@ -144,7 +164,18 @@ def authenticate_and_validate(request: Request) -> str:
 
     return token
 
-# ----------------- Discovery Route -----------------
+# ----------------- Discovery & Root Routes -----------------
+
+@app.get("/")
+@app.get("/a2a")
+@app.get("/a2a/")
+@app.head("/")
+@app.head("/a2a")
+@app.head("/a2a/")
+async def root_discovery(request: Request):
+    base_url = get_base_url(request)
+    card = build_agent_card(base_url)
+    return a2a_response(card)
 
 @app.get("/.well-known/agent-card.json")
 @app.get("/a2a/.well-known/agent-card.json")
@@ -433,4 +464,5 @@ async def cancel_task_endpoint(id: str, request: Request):
 if __name__ == "__main__":
     init_db()
     print("Starting A2A Invoice Agent on port 8000...")
+    sys.stdout.flush()
     uvicorn.run(app, host="0.0.0.0", port=8000)
