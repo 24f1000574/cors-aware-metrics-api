@@ -177,6 +177,28 @@ async def root_discovery(request: Request):
     card = build_agent_card(base_url)
     return a2a_response(card)
 
+@app.get("/internal/diagnostics")
+@app.get("/a2a/internal/diagnostics")
+async def get_diagnostics():
+    from storage import get_db
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT action, COUNT(*) FROM decision_cache GROUP BY action")
+    action_counts = dict(c.fetchall())
+    c.execute("SELECT task_id, proposals_json, task_json FROM tasks ORDER BY rowid DESC LIMIT 3")
+    sample_tasks = []
+    for row in c.fetchall():
+        sample_tasks.append({
+            "task_id": row["task_id"],
+            "proposals": json.loads(row["proposals_json"]) if row["proposals_json"] else [],
+            "task": json.loads(row["task_json"]) if row["task_json"] else {}
+        })
+    conn.close()
+    return a2a_response({
+        "action_counts": action_counts,
+        "sample_tasks": sample_tasks
+    })
+
 @app.get("/.well-known/agent-card.json")
 @app.get("/a2a/.well-known/agent-card.json")
 async def get_agent_card(request: Request):
