@@ -1,4 +1,7 @@
 __pycache__/
 *.pyc
 .env
-.venv/
+invoice_agent.db
+test_ollama.py
+test_orders.py
+test_agent.py
